@@ -1,0 +1,116 @@
+pipeline {
+    agent any
+
+    options {
+        timeout(time: 6, unit: 'DAYS')   // Max runtime: 6 days
+    }
+
+    environment {
+        LOG_DIR = "/var/log/jenkins/ansible-logs/data_cleanup_job"
+    }
+
+    stages {
+        stage('Execute playbook') {
+            steps {
+                sh '''
+                    cd /etc/ansible/data_cleanup_job
+                    export ANSIBLE_CONFIG=../ansible.cfg
+
+                    ansible-playbook cleanup_task.yml -e "build_number=${BUILD_NUMBER}"
+
+                    mkdir -p "$WORKSPACE/logs"
+
+                    log04_final="${LOG_DIR}/deleted_items_${BUILD_NUMBER}.log"
+                    log05_final="${LOG_DIR}/scanned_directories_${BUILD_NUMBER}.log"
+
+                    [ -f "$log04_final" ] && cp "$log04_final" "$WORKSPACE/logs/"
+                    [ -f "$log05_final" ] && cp "$log05_final" "$WORKSPACE/logs/"
+                '''
+            }
+        }
+    }
+
+    post {
+
+        aborted {
+            script {
+                currentBuild.description = "CLOSED_BY_TIMEOUT (6 DAYS)"
+                echo "Pipeline timed out — marked as CLOSED_BY_TIMEOUT (6 DAYS)"
+            }
+        }
+
+        always {
+            script {
+                try {
+                    def log04File = "logs/deleted_items_${BUILD_NUMBER}.log"
+                    def log05File = "logs/scanned_directories_${BUILD_NUMBER}.log"
+
+                    def log04 = fileExists(log04File) ? readFile(log04File).trim() : ""
+                    def log05 = fileExists(log05File) ? readFile(log05File).trim() : ""
+
+                    def missingMsg = "THE SPECIFIED SEARCH DIRECTORY DOES NOT EXIST"
+                    def hasMissingIn04 = log04.contains(missingMsg)
+                    def hasMissingIn05 = log05.contains(missingMsg)
+
+                    String emailDeletedItems
+                    if (hasMissingIn04) emailDeletedItems = log04
+                    else if (hasMissingIn05) emailDeletedItems = log05
+                    else if (log04) emailDeletedItems = log04
+                    else if (log05) emailDeletedItems = log05
+                    else emailDeletedItems = "NO FILES OR FOLDERS TO DELETE"
+
+                    def htmlEscape = { s ->
+                        (s ?: "")
+                            .replace("&", "&amp;")
+                            .replace("<", "&lt;")
+                            .replace(">", "&gt;")
+                    }
+
+                    def deletionTime = new Date(currentBuild.startTimeInMillis)
+                        .format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('Europe/Berlin'))
+
+                    def timeoutNote = ""
+                    if ((currentBuild.description ?: "").contains("TIMEOUT")) {
+                        timeoutNote = "<br><b>⚠ This job was CLOSED BY TIMEOUT (6 DAYS).</b><br><br>"
+                    }
+
+                    def emailBody = """
+                        Jenkins Job: ${env.JOB_NAME}<br>
+                        Build Number: ${env.BUILD_NUMBER}<br>
+                        Build URL: ${env.BUILD_URL}<br><br>
+                        ${timeoutNote}
+                        <h3>Time of Deletion: ${deletionTime}</h3>
+                        <h3>Deleted Items:</h3>
+                        <pre>${htmlEscape(emailDeletedItems)}</pre>
+                    """
+
+                    def attachments = []
+                    if (fileExists(log04File)) attachments.add(log04File)
+                    if (fileExists(log05File)) attachments.add(log05File)
+
+                    if (attachments) {
+                        emailext(
+                            subject: "Jenkins Job: ${env.JOB_NAME} - Build #${env.BUILD_NUMBER} (${currentBuild.result})",
+                            body: emailBody,
+                            mimeType: 'text/html',
+                            to: "notify@example.com",
+                            from: "jenkins@example.com",
+                            attachmentsPattern: attachments.join(',')
+                        )
+                    } else {
+                        emailext(
+                            subject: "Jenkins Job: ${env.JOB_NAME} - Build #${env.BUILD_NUMBER} (${currentBuild.result})",
+                            body: emailBody,
+                            mimeType: 'text/html',
+                            to: "notify@example.com",
+                            from: "jenkins@example.com"
+                        )
+                    }
+                } catch (Exception e) {
+                    echo "Email sending failed: ${e.message}"
+                }
+            }
+            cleanWs()
+        }
+    }
+}

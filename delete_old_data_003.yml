@@ -1,0 +1,226 @@
+---
+- name: Cleanup old data in target directory
+  hosts: target_hosts
+  gather_facts: yes
+
+  vars:
+    log01: "/tmp/log01_{{ build_number }}_{{ ansible_date_time.iso8601_basic_short }}.log"
+    log02: "/tmp/log02_{{ build_number }}_{{ ansible_date_time.iso8601_basic_short }}.log"
+    log03: "/tmp/log03_{{ build_number }}_{{ ansible_date_time.iso8601_basic_short }}.log"
+    retention_days: 14
+
+  tasks:
+
+    - name: Debug current target_dir
+      ansible.builtin.debug:
+        msg: "Processing directory: {{ target_dir }}"
+
+    ###########################################################################
+    # LOG01 — Full tree with last-activity timestamp (mtime/ctime only)
+    ###########################################################################
+    - name: Build log01 with last-activity timestamps (mtime/ctime)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        find {{ target_dir | quote }} -print0 |
+        while IFS= read -r -d '' p; do
+          M=$(stat -c '%Y' -- "$p")
+          C=$(stat -c '%Z' -- "$p")
+          max=$M; src="mtime"
+          [ "$C" -gt "$max" ] && max=$C && src="ctime"
+          printf "%s --- %s (%s)\n" \
+            "$p" \
+            "$(date -d @"$max" '+%Y-%m-%d %H:%M:%S')" \
+            "$src"
+        done
+      args:
+        executable: /bin/bash
+      register: log01_lines
+      changed_when: false
+
+    - name: Write sorted log01
+      ansible.builtin.copy:
+        content: |
+          {% for line in (log01_lines.stdout_lines | default([]) | sort) %}
+          {{ line }}
+          {% endfor %}
+        dest: "{{ log01 }}"
+        force: yes
+
+    ###########################################################################
+    # LOG02 — Directories older than retention_days, sorted deepest first
+    ###########################################################################
+    - name: Find directories older than {{ retention_days }} days
+      ansible.builtin.shell: |
+        set -euo pipefail
+        now=$(date +%s)
+        threshold=$(( {{ retention_days }} * 24 * 3600 ))
+        tmp="$(mktemp)"
+
+        find "{{ target_dir }}" -type d -print0 |
+        while IFS= read -r -d '' d; do
+          M=$(stat -c '%Y' -- "$d")
+          C=$(stat -c '%Z' -- "$d")
+          max=$M
+          [ "$C" -gt "$max" ] && max=$C
+
+          if [ $((now - max)) -gt $threshold ]; then
+            awk -v s="$d" 'BEGIN { print length(s), s }' >> "$tmp"
+          fi
+        done
+
+        sort -nr "$tmp" | cut -d" " -f2- > "{{ log02 }}"
+        rm -f "$tmp"
+      args:
+        executable: /bin/bash
+
+    ###########################################################################
+    # DELETE files older than retention_days
+    ###########################################################################
+    - name: Delete files older than {{ retention_days }} days
+      ansible.builtin.shell: |
+        set -euo pipefail
+        now=$(date +%s)
+        threshold=$(( {{ retention_days }} * 24 * 3600 ))
+
+        find "{{ target_dir }}" -type f -print0 |
+        while IFS= read -r -d '' f; do
+          M=$(stat -c '%Y' -- "$f")
+          C=$(stat -c '%Z' -- "$f")
+          max=$M
+          [ "$C" -gt "$max" ] && max=$C
+
+          if [ $((now - max)) -gt $threshold ]; then
+            chmod u+rwx "$f"
+            rm -f "$f"
+          fi
+        done
+      args:
+        executable: /bin/bash
+
+    ###########################################################################
+    # DELETE empty directories listed in log02
+    ###########################################################################
+    - name: Read log02
+      ansible.builtin.slurp:
+        src: "{{ log02 }}"
+      register: log02_raw
+
+    - name: Build list of dirs to check
+      ansible.builtin.set_fact:
+        dirs_to_check: >-
+          {{
+            log02_raw.content | b64decode | regex_findall('[^\n]+')
+            | reject('equalto', target_dir)
+            | list
+          }}
+
+    - name: Delete empty directories
+      ansible.builtin.shell: |
+        d="{{ item }}"
+        if [ -d "$d" ]; then
+          if [ -z "$(find "$d" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            chmod u+rwx "$d"
+            rm -rf "$d"
+          fi
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ dirs_to_check }}"
+
+    ###########################################################################
+    # Delete target_dir if empty
+    ###########################################################################
+    - name: Delete target_dir if empty
+      ansible.builtin.shell: |
+        set -euo pipefail
+        td="{{ target_dir }}"
+        [ -n "$td" ] || exit 0
+        [ "$td" != "/" ] || exit 0
+        [ -d "$td" ] || exit 0
+
+        if [ -z "$(ls -A -- "$td")" ]; then
+          chmod u+rwx -- "$td" || true
+          rmdir -- "$td"
+        fi
+      args:
+        executable: /bin/bash
+
+    ###########################################################################
+    # LOG03 — Paths actually deleted
+    ###########################################################################
+    - name: Read log01
+      ansible.builtin.slurp:
+        src: "{{ log01 }}"
+      register: log01_raw
+
+    - name: Split log01 into list
+      ansible.builtin.set_fact:
+        log01_entries: "{{ (log01_raw.content | b64decode).split('\n') | reject('equalto','') | list }}"
+
+    - name: Check existence of each path
+      ansible.builtin.stat:
+        path: "{{ item.split(' --- ')[0] | trim }}"
+      loop: "{{ log01_entries }}"
+      register: stat_results
+
+    - name: Build list of deleted paths
+      ansible.builtin.set_fact:
+        deleted_items: >-
+          {{
+            stat_results.results
+            | zip(log01_entries)
+            | selectattr('0.stat.exists','equalto',False)
+            | map(attribute='1')
+            | list
+          }}
+
+    - name: Write log03
+      ansible.builtin.copy:
+        content: |
+          {% for entry in deleted_items %}
+          {{ entry }}
+          {% endfor %}
+        dest: "{{ log03 }}"
+        force: yes
+
+    ###########################################################################
+    # Fetch logs to controller and append to global logs
+    ###########################################################################
+    - name: Fetch log03 to controller
+      ansible.builtin.fetch:
+        src: "{{ log03 }}"
+        dest: "/tmp/"
+        flat: yes
+
+    - name: Append log03 to global log04
+      delegate_to: localhost
+      ansible.builtin.shell: cat "/tmp/{{ log03 | basename }}" >> "{{ log04_path }}"
+      args:
+        executable: /bin/bash
+
+    - name: Fetch log01 to controller
+      ansible.builtin.fetch:
+        src: "{{ log01 }}"
+        dest: "/tmp/"
+        flat: yes
+
+    - name: Append log01 to global log06
+      delegate_to: localhost
+      ansible.builtin.shell: cat "/tmp/{{ log01 | basename }}" >> "{{ log06_path }}"
+      args:
+        executable: /bin/bash
+
+    - name: Cleanup remote logs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ log01 }}"
+        - "{{ log02 }}"
+        - "{{ log03 }}"
+
+    - name: Cleanup temp fetched file on controller
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: "/tmp/{{ log03 | basename }}"
+        state: absent

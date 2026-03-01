@@ -1,0 +1,197 @@
+---
+- name: Discover subdirectories and run cleanup
+  hosts: target_hosts
+  gather_facts: yes
+
+  vars:
+    parent_dir: "/path/to/data"
+    logs_base: "/path/to/ansible-logs"
+
+    # Jenkins copies these logs from controller
+    log04: "{{ logs_base }}/deleted_data_{{ build_number }}.log"
+    log05: "{{ logs_base }}/discovered_dirs_{{ build_number }}.log"
+    log06: "{{ logs_base }}/all_data_{{ build_number }}.log"
+
+    # Always 14 days
+    retention_days: 14
+
+  tasks:
+
+    - name: Ensure logs directory exists on controller
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: "{{ logs_base }}"
+        state: directory
+        mode: '0775'
+
+    - name: Ensure log04 exists
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: "{{ log04 }}"
+        state: touch
+        mode: '0666'
+
+    - name: Ensure log05 exists
+      delegate_to: localhost
+      ansible.builtin.file:
+        path: "{{ log05 }}"
+        state: touch
+        mode: '0666'
+
+    # Check parent dir
+    - name: Check if parent_dir exists
+      ansible.builtin.stat:
+        path: "{{ parent_dir }}"
+      register: parent_dir_stat
+
+    # --- Important: write explicit message and end play if missing ---
+    - name: Log message if parent_dir is missing (log04)
+      delegate_to: localhost
+      ansible.builtin.lineinfile:
+        path: "{{ log04 }}"
+        line: "THE SPECIFIED SEARCH DIRECTORY DOES NOT EXIST - {{ parent_dir }}"
+        insertafter: EOF
+        create: yes
+      when: not parent_dir_stat.stat.exists
+
+    - name: Log message if parent_dir is missing (log05)
+      delegate_to: localhost
+      ansible.builtin.lineinfile:
+        path: "{{ log05 }}"
+        line: "THE SPECIFIED SEARCH DIRECTORY DOES NOT EXIST - {{ parent_dir }}"
+        insertafter: EOF
+        create: yes
+      when: not parent_dir_stat.stat.exists
+
+    - name: End play if parent_dir does not exist
+      ansible.builtin.meta: end_play
+      when: not parent_dir_stat.stat.exists
+
+    # Discover directories
+    - name: Discover subdirectories under parent_dir
+      ansible.builtin.shell: |
+        find "{{ parent_dir }}" -mindepth 1 -maxdepth 1 -type d -print0 | xargs -0 -I {} echo '"{}"'
+      args:
+        executable: /bin/bash
+      register: discovered_dirs
+      changed_when: false
+
+    - name: Build directory list
+      ansible.builtin.set_fact:
+        target_directories: "{{ discovered_dirs.stdout_lines | map('regex_replace','^\"(.*)\"$','\\1') | list }}"
+
+    - name: Detect empty directory list
+      ansible.builtin.set_fact:
+        no_dirs_found: "{{ target_directories | length == 0 }}"
+
+    # ========================================================================
+    # TOP-LEVEL FILE CLEANUP (LAST ACTIVITY SCAN) — mtime/ctime only
+    # ========================================================================
+
+    - name: Scan top-level files older than {{ retention_days }} days by last activity (mtime/ctime)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        now=$(date +%s)
+        threshold=$(( {{ retention_days }} * 24 * 3600 ))
+
+        find "{{ parent_dir }}" -maxdepth 1 -mindepth 1 -type f -print0 |
+        while IFS= read -r -d '' f; do
+          M=$(stat -c '%Y' -- "$f")
+          C=$(stat -c '%Z' -- "$f")
+
+          max=$M; src="mtime"
+          [ "$C" -gt "$max" ] && max=$C && src="ctime"
+
+          if [ $((now - max)) -gt $threshold ]; then
+            printf "%s\t%s\t%s\n" "$f" "$(date -d @"$max" '+%Y-%m-%d %H:%M:%S')" "$src"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: old_files_lastact
+      changed_when: false
+
+    - name: Append old file entries to log04
+      delegate_to: localhost
+      ansible.builtin.lineinfile:
+        path: "{{ log04 }}"
+        line: "{{ item.split('\t')[0] }} --- {{ item.split('\t')[1] }} ({{ item.split('\t')[2] }})"
+        insertafter: EOF
+        create: yes
+      loop: "{{ old_files_lastact.stdout_lines }}"
+      when: old_files_lastact.stdout_lines | length > 0
+
+    - name: Delete old top-level files
+      ansible.builtin.shell: |
+        while IFS= read -r line; do
+          f="$(echo "$line" | cut -f1)"
+          [ -n "$f" ] && chmod u+rwx "$f" && rm -f "$f"
+        done <<< "$(printf "%s\n" "{{ old_files_lastact.stdout | default('') }}")"
+      args:
+        executable: /bin/bash
+      when: old_files_lastact.stdout_lines | length > 0
+
+    # ========================================================================
+    # SUBDIRECTORIES PROCESSING
+    # ========================================================================
+
+    - name: Init log05 with PENDING entries
+      delegate_to: localhost
+      ansible.builtin.shell: |
+        current_time=$(date '+%Y-%m-%d %H:%M:%S')
+        {
+        {% for d in target_directories %}
+          echo "{{ d }} --- PENDING @ ${current_time}"
+        {% endfor %}
+        } > "{{ log05 }}"
+      args:
+        executable: /bin/bash
+      when: not no_dirs_found
+
+    - name: Run cleanup for each subdirectory
+      ansible.builtin.include_tasks: delete_old_data_002.yml
+      loop: "{{ target_directories }}"
+      loop_control:
+        loop_var: subdir
+      vars:
+        target_dir: "{{ subdir }}"
+        log04_path: "{{ log04 }}"
+        log05_path: "{{ log05 }}"
+        log06_path: "{{ log06 }}"
+        build_number: "{{ build_number }}"
+        retention_days: 14
+      when: not no_dirs_found
+
+    # Final logs check — run ONLY if parent_dir exists (avoid overwriting missing-dir msg)
+    - name: Ensure log04 not empty
+      delegate_to: localhost
+      ansible.builtin.copy:
+        content: "NO FILES OR FOLDERS TO DELETE\n"
+        dest: "{{ log04 }}"
+      when:
+        - parent_dir_stat.stat.exists
+        - (lookup('file', log04) | trim) == ''
+
+    - name: Ensure log05 not empty
+      delegate_to: localhost
+      ansible.builtin.copy:
+        content: "NO DIRECTORIES TO PROCESS\n"
+        dest: "{{ log05 }}"
+      when:
+        - parent_dir_stat.stat.exists
+        - (lookup('file', log05) | trim) == ''
+
+    - name: Normalize log files
+      delegate_to: localhost
+      ansible.builtin.shell: |
+        tmp="$(mktemp)"
+        awk 'NF' {{ lf | quote }} | sort -u > "$tmp"
+        mv "$tmp" {{ lf | quote }}
+      loop:
+        - "{{ log04 }}"
+        - "{{ log05 }}"
+      loop_control:
+        loop_var: lf
+      args:
+        executable: /bin/bash
+      when: parent_dir_stat.stat.exists

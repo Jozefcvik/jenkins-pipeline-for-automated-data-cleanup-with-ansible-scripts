@@ -1,0 +1,38 @@
+---
+- name: Mark directory as RUN
+  delegate_to: localhost
+  ansible.builtin.shell: |
+    current_time=$(date '+%Y-%m-%d %H:%M:%S')
+    sed -i "s|^{{ target_dir | regex_escape }}.*|& --- RUN @ ${current_time}|" "{{ log05_path }}"
+  args:
+    executable: /bin/bash
+
+- name: Debug current directory
+  ansible.builtin.debug:
+    msg: "Processing directory: {{ target_dir }}"
+
+- name: Run cleanup playbook for target_dir
+  delegate_to: localhost
+  ansible.builtin.shell: >
+    delete_old_data_003.yml
+    -e '{"target_dir": {{ target_dir | to_json }}}'
+    -e "log04_path={{ log04_path }}"
+    -e "log06_path={{ log06_path }}"
+    -e "retention_days=14"
+    -e "build_number={{ build_number }}"
+  args:
+    executable: /bin/bash
+  register: cleanup_result
+  ignore_errors: yes
+
+- name: Mark directory DONE or FAILED
+  delegate_to: localhost
+  ansible.builtin.shell: |
+    current_time=$(date '+%Y-%m-%d %H:%M:%S')
+    if [ "{{ cleanup_result.rc | default(1) }}" -eq 0 ]; then
+      sed -i "s|^{{ target_dir | regex_escape }}.*|& --- DONE @ ${current_time}|" "{{ log05_path }}"
+    else
+      sed -i "s|^{{ target_dir | regex_escape }}.*|& --- FAILED @ ${current_time}|" "{{ log05_path }}"
+    fi
+  args:
+    executable: /bin/bash
