@@ -1,4 +1,4 @@
-# Jenkins Pipeline for Automated Data Cleanup
+# 🚀 Jenkins Pipeline for Automated Data Cleanup
 
 This repository contains a Jenkins pipeline that automates the cleanup of old files and directories on target hosts using Ansible. The pipeline is designed to execute three sequential Ansible playbooks, ensuring structured logging, retention management, and notifications for deleted items.
 
@@ -8,9 +8,9 @@ This repository contains a Jenkins pipeline that automates the cleanup of old fi
 
 - **Automated cleanup of old data:** Deletes files older than a configured retention period (default: 14 days) from a specified parent directory.
 - **Multi-stage Ansible execution:**
-  1. delete_old_data_001.yml — Discover subdirectories and initialize logging.
-  2. delete_old_data_002.yml — Process each subdirectory, marking status as RUN, DONE, or FAILED.
-  3. delete_old_data_003.yml — Scan and delete old files, remove empty directories, and maintain detailed logs.
+  1. `delete_old_data_001.yml` — Discover subdirectories and initialize logging.
+  2. `delete_old_data_002.yml` — Process each subdirectory, marking status as RUN, DONE, or FAILED.
+  3. `delete_old_data_003.yml` — Scan and delete old files, remove empty directories, and maintain detailed logs.
 - **Detailed logging:**
   - deleted_items_<build_number>.log — Tracks deleted files.
   - scanned_directories_<build_number>.log — Tracks directories processed and their status.
