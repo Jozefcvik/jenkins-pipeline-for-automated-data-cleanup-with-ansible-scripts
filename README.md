@@ -2,6 +2,8 @@
 
 This repository contains a Jenkins pipeline that automates the cleanup of old files and directories on target hosts using Ansible. The pipeline is designed to execute three sequential Ansible playbooks, ensuring structured logging, retention management, and notifications for deleted items.
 
+![Jenkins pipeline for automated data cleanup](jenkins-pipeline-for-automated-data-cleanup-with-ansible-scripts.png)
+
 ##
 
 ### 📌 Features
@@ -19,6 +21,7 @@ This repository contains a Jenkins pipeline that automates the cleanup of old fi
 - **Email notifications:** Sends a summary email including logs and deletion details after each build.
 - **Timeout safety:** Configurable pipeline timeout (default: 6 days) to prevent indefinitely running jobs.
 - **Workspace cleanup:** Cleans Jenkins workspace after job completion to save disk space.
+- **Scheduled execution:** Pipeline is configured in Jenkins to run automatically once per week.
 
 ## 
 
